@@ -11,10 +11,15 @@ import {
 } from './crypto.js';
 import { checkCloudflaredInstalled, startTunnel } from './tunnel.js';
 import { printQrToTerminal, saveQrPng } from './pairing.js';
+import { AgentSession } from './agentSession.js';
 
 const LOCAL_PORT = process.env.REMOTEBUILD_PORT
   ? Number(process.env.REMOTEBUILD_PORT)
   : 7532;
+
+const AGENT_CMD = process.env.AGENT_CMD || 'claude';
+const AGENT_ARGS = process.env.AGENT_ARGS ? process.env.AGENT_ARGS.split(' ') : [];
+const AGENT_CWD = process.env.AGENT_CWD || process.cwd();
 
 async function main() {
   console.log('remoteBuild daemon starting...\n');
@@ -34,8 +39,39 @@ async function main() {
   let pairingToken = generatePairingToken();
   let tokenConsumed = false;
 
-  // session state for the single paired client (Phase 1: one device at a time)
-  let session = null; // { rx, tx, id }
+  // Devices that completed the one-time QR pairing can reconnect for the
+  // rest of this daemon's lifetime without rescanning (e.g. after the phone
+  // locks or the network drops), using a longer-lived device token.
+  const deviceTokens = new Set();
+
+  // Single active connection + single active agent session, matching
+  // Phase 1's one-device-at-a-time scope.
+  let paired = null; // { rx, tx, id, ws }
+  let agentSession = null;
+
+  function sendEncrypted(ws, key, obj) {
+    if (ws.readyState !== ws.OPEN) return;
+    const frame = encrypt(key, obj);
+    ws.send(JSON.stringify({ type: 'enc', ...frame }));
+  }
+
+  function startAgentSession(cols, rows) {
+    agentSession = new AgentSession({
+      cmd: AGENT_CMD,
+      args: AGENT_ARGS,
+      cwd: AGENT_CWD,
+      cols: cols || 100,
+      rows: rows || 30,
+      onData: (data) => {
+        if (paired) sendEncrypted(paired.ws, paired.tx, { type: 'session:output', data });
+      },
+      onExit: ({ exitCode, signal }) => {
+        if (paired) sendEncrypted(paired.ws, paired.tx, { type: 'session:exit', exitCode, signal });
+        agentSession = null;
+      },
+    });
+    console.log(`Agent session started: ${AGENT_CMD} ${AGENT_ARGS.join(' ')}`.trim());
+  }
 
   const wss = new WebSocketServer({ port: LOCAL_PORT, host: '127.0.0.1' });
   console.log(`Local WebSocket server listening on ws://127.0.0.1:${LOCAL_PORT}`);
@@ -61,25 +97,55 @@ async function main() {
           ws.close(4000, 'expected hello');
           return;
         }
-        if (tokenConsumed || msg.token !== pairingToken) {
-          console.warn(`[${connId}] invalid or reused pairing token, rejecting`);
-          ws.send(JSON.stringify({ type: 'hello-reject', reason: 'invalid_token' }));
-          ws.close(4001, 'invalid token');
+
+        const usingPairingToken = Boolean(msg.token);
+        const usingDeviceToken = Boolean(msg.deviceToken);
+
+        if (usingPairingToken) {
+          if (tokenConsumed || msg.token !== pairingToken) {
+            console.warn(`[${connId}] invalid or reused pairing token, rejecting`);
+            ws.send(JSON.stringify({ type: 'hello-reject', reason: 'invalid_token' }));
+            ws.close(4001, 'invalid token');
+            return;
+          }
+          tokenConsumed = true;
+        } else if (usingDeviceToken) {
+          if (!deviceTokens.has(msg.deviceToken)) {
+            console.warn(`[${connId}] unknown device token, rejecting`);
+            ws.send(JSON.stringify({ type: 'hello-reject', reason: 'unknown_device' }));
+            ws.close(4001, 'unknown device');
+            return;
+          }
+        } else {
+          ws.send(JSON.stringify({ type: 'hello-reject', reason: 'missing_token' }));
+          ws.close(4001, 'missing token');
           return;
         }
 
-        tokenConsumed = true;
         const { rx, tx } = deriveServerSessionKeys(serverKeypair, msg.pub);
-        session = { rx, tx, id: connId, ws };
+        const deviceToken = usingDeviceToken ? msg.deviceToken : randomUUID();
+        deviceTokens.add(deviceToken);
+
+        paired = { rx, tx, id: connId, ws };
         handshakeComplete = true;
 
         ws.send(
           JSON.stringify({
             type: 'hello-ack',
             pub: publicKeyToB64(serverKeypair),
+            deviceToken,
           }),
         );
         console.log(`[${connId}] paired successfully — session encrypted`);
+
+        // If an agent session is already running (e.g. this device
+        // reconnected after a drop), resume it and replay recent output.
+        if (agentSession) {
+          sendEncrypted(ws, tx, { type: 'session:started', resumed: true });
+          if (agentSession.buffer) {
+            sendEncrypted(ws, tx, { type: 'session:output', data: agentSession.buffer });
+          }
+        }
         return;
       }
 
@@ -91,25 +157,62 @@ async function main() {
 
       let inner;
       try {
-        inner = decrypt(session.rx, msg);
+        inner = decrypt(paired.rx, msg);
       } catch (err) {
         console.warn(`[${connId}] failed to decrypt frame: ${err.message}`);
         return;
       }
 
-      console.log(`[${connId}] decrypted message:`, inner);
+      switch (inner.type) {
+        case 'ping': {
+          sendEncrypted(ws, paired.tx, { type: 'pong', at: Date.now(), echo: inner.at });
+          break;
+        }
 
-      if (inner.type === 'ping') {
-        const frame = encrypt(session.tx, { type: 'pong', at: Date.now(), echo: inner.at });
-        ws.send(JSON.stringify({ type: 'enc', ...frame }));
+        case 'session:start': {
+          if (agentSession) {
+            sendEncrypted(ws, paired.tx, { type: 'session:started', resumed: true });
+            if (agentSession.buffer) {
+              sendEncrypted(ws, paired.tx, { type: 'session:output', data: agentSession.buffer });
+            }
+            break;
+          }
+          startAgentSession(inner.cols, inner.rows);
+          sendEncrypted(ws, paired.tx, { type: 'session:started', resumed: false });
+          break;
+        }
+
+        case 'session:input': {
+          if (agentSession) agentSession.write(inner.data);
+          break;
+        }
+
+        case 'session:resize': {
+          if (agentSession) agentSession.resize(inner.cols, inner.rows);
+          break;
+        }
+
+        case 'session:stop': {
+          if (agentSession) {
+            agentSession.kill();
+            agentSession = null;
+          }
+          break;
+        }
+
+        default:
+          console.log(`[${connId}] decrypted message:`, inner);
       }
     });
 
     ws.on('close', () => {
       console.log(`[${connId}] connection closed`);
-      if (session && session.id === connId) {
-        session = null;
+      if (paired && paired.id === connId) {
+        paired = null;
       }
+      // Note: the agent session (if any) is intentionally left running so a
+      // reconnecting device can resume it — it's only killed on explicit
+      // session:stop or daemon shutdown.
     });
 
     ws.on('error', (err) => {
@@ -141,7 +244,14 @@ async function main() {
     console.warn(`Could not save QR PNG: ${err.message}`);
   }
 
-  console.log('\nWaiting for a device to pair... (this pairing token is single-use)');
+  console.log(`\nAgent command: ${AGENT_CMD} ${AGENT_ARGS.join(' ')}`.trim());
+  console.log('Waiting for a device to pair... (this pairing token is single-use)');
+
+  process.on('SIGINT', () => {
+    console.log('\nShutting down...');
+    if (agentSession) agentSession.kill();
+    process.exit(0);
+  });
 }
 
 main().catch((err) => {

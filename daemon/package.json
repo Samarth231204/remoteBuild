@@ -5,10 +5,12 @@
   "type": "module",
   "main": "src/index.js",
   "scripts": {
-    "start": "node src/index.js"
+    "start": "node src/index.js",
+    "postinstall": "node scripts/fix-pty-permissions.js"
   },
   "dependencies": {
     "libsodium-wrappers": "^0.7.15",
+    "node-pty": "^1.1.0",
     "qrcode": "^1.5.4",
     "qrcode-terminal": "^0.12.0",
     "ws": "^8.18.0"

@@ -18,12 +18,20 @@ export function checkCloudflaredInstalled() {
 // Resolves with the public https URL once cloudflared prints it.
 export function startTunnel(localPort) {
   return new Promise((resolve, reject) => {
-    const proc = spawn('cloudflared', [
+    const args = [
       'tunnel',
       '--url',
       `http://localhost:${localPort}`,
       '--no-autoupdate',
-    ]);
+    ];
+    // QUIC (cloudflared's default transport) runs over UDP, which some
+    // networks throttle or block, causing an endless "control stream
+    // encountered a failure" retry loop that never stabilizes. HTTP/2 runs
+    // over plain TCP and works everywhere QUIC doesn't.
+    if (process.env.REMOTEBUILD_TUNNEL_PROTOCOL) {
+      args.push('--protocol', process.env.REMOTEBUILD_TUNNEL_PROTOCOL);
+    }
+    const proc = spawn('cloudflared', args);
 
     let resolved = false;
     const timeout = setTimeout(() => {

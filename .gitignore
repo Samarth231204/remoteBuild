@@ -38,3 +38,4 @@ daemon/pairing-qr.png
 # Project docs (kept local, not committed)
 implementation_plan.md
 phase1_implementation.md
+phase2_implementation.md

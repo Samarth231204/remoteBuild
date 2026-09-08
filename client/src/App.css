@@ -47,6 +47,70 @@
   font-weight: 600;
 }
 
+.idle-actions {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.ghost {
+  background: transparent;
+  border: 1px solid #9ca3af;
+  border-radius: 0.5rem;
+  padding: 0.5rem 1rem;
+  cursor: pointer;
+}
+
+.session-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.terminal {
+  text-align: left;
+  background: #000;
+  color: #e5e7eb;
+  font-size: 0.7rem;
+  padding: 0.75rem;
+  border-radius: 0.5rem;
+  height: 45vh;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.control-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.control-key {
+  flex: 1 0 auto;
+  min-width: 2.5rem;
+  padding: 0.5rem 0.6rem;
+  border-radius: 0.4rem;
+  border: 1px solid #9ca3af;
+  background: #1f2937;
+  color: #e5e7eb;
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+
+.input-row {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.input-row input {
+  flex: 1;
+  padding: 0.5rem;
+  border-radius: 0.5rem;
+  border: 1px solid #9ca3af;
+}
+
 .log {
   margin-top: 1.5rem;
   text-align: left;
