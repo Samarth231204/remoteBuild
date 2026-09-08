@@ -1,0 +1,17 @@
+{
+  "name": "remoteBuild",
+  "short_name": "remoteBuild",
+  "description": "Remotely monitor and control your CLI coding agents from your phone.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#111827",
+  "theme_color": "#2563eb",
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}
