@@ -68,17 +68,51 @@
   gap: 0.5rem;
 }
 
-.terminal {
-  text-align: left;
+.xterm-container {
   background: #000;
-  color: #e5e7eb;
-  font-size: 0.7rem;
-  padding: 0.75rem;
   border-radius: 0.5rem;
+  padding: 0.5rem;
   height: 45vh;
-  overflow-y: auto;
-  white-space: pre-wrap;
-  word-break: break-word;
+  overflow: hidden;
+}
+
+.prompt-banner {
+  background: #78350f;
+  border: 1px solid #f59e0b;
+  border-radius: 0.5rem;
+  padding: 0.6rem 0.8rem;
+  text-align: left;
+}
+
+.prompt-banner p {
+  margin: 0 0 0.5rem;
+  font-size: 0.85rem;
+  color: #fde68a;
+}
+
+.prompt-actions {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.prompt-actions .approve {
+  background: #16a34a;
+  color: white;
+  border: none;
+  border-radius: 0.4rem;
+  padding: 0.5rem 1rem;
+  cursor: pointer;
+  flex: 1;
+}
+
+.prompt-actions .deny {
+  background: #dc2626;
+  color: white;
+  border: none;
+  border-radius: 0.4rem;
+  padding: 0.5rem 1rem;
+  cursor: pointer;
+  flex: 1;
 }
 
 .control-row {

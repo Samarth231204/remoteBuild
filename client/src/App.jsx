@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import QrScanner from './QrScanner.jsx';
+import XTermView from './XTermView.jsx';
 import {
   initCrypto,
   generateClientKeypair,
@@ -9,9 +10,11 @@ import {
   toB64,
 } from './crypto.js';
 import { stripAnsi } from './ansi.js';
+import { detectPermissionPrompt } from './promptDetector.js';
 import './App.css';
 
 const STORAGE_KEY = 'remotebuild_pairing';
+const PROMPT_TAIL_CHARS = 4000;
 
 function loadSavedPairing() {
   try {
@@ -42,21 +45,24 @@ function clearSavedPairing() {
 export default function App() {
   const [phase, setPhase] = useState('idle');
   const [log, setLog] = useState([]);
-  const [output, setOutput] = useState('');
   const [inputValue, setInputValue] = useState('');
   const [savedPairing, setSavedPairing] = useState(() => loadSavedPairing());
+  const [pendingPrompt, setPendingPrompt] = useState(null);
 
   const wsRef = useRef(null);
   const sessionRef = useRef(null); // { rx, tx }
-  const outputEndRef = useRef(null);
+  const xtermRef = useRef(null);
+  const promptTailRef = useRef('');
 
   const appendLog = useCallback((line) => {
     setLog((prev) => [...prev.slice(-19), `${new Date().toLocaleTimeString()}  ${line}`]);
   }, []);
 
-  useEffect(() => {
-    outputEndRef.current?.scrollIntoView({ block: 'end' });
-  }, [output]);
+  const sendFrame = useCallback((obj) => {
+    if (!wsRef.current || !sessionRef.current) return;
+    const frame = encrypt(sessionRef.current.tx, obj);
+    wsRef.current.send(JSON.stringify({ type: 'enc', ...frame }));
+  }, []);
 
   const handleFrame = useCallback(
     (inner) => {
@@ -64,20 +70,35 @@ export default function App() {
         appendLog(`pong received — round trip ${Date.now() - inner.echo}ms`);
         return;
       }
+
       if (inner.type === 'session:started') {
         appendLog(`session started (resumed=${inner.resumed})`);
+        if (!inner.resumed) {
+          xtermRef.current?.clear();
+          promptTailRef.current = '';
+          setPendingPrompt(null);
+        }
         setPhase('session');
         return;
       }
+
       if (inner.type === 'session:output') {
-        setOutput((prev) => prev + stripAnsi(inner.data));
+        xtermRef.current?.write(inner.data);
+
+        promptTailRef.current = (promptTailRef.current + stripAnsi(inner.data)).slice(
+          -PROMPT_TAIL_CHARS,
+        );
+        setPendingPrompt(detectPermissionPrompt(promptTailRef.current));
         return;
       }
+
       if (inner.type === 'session:exit') {
         appendLog(`session exited (code=${inner.exitCode}, signal=${inner.signal})`);
+        setPendingPrompt(null);
         setPhase('paired');
         return;
       }
+
       if (inner.type === 'session:error') {
         appendLog(`session error: ${inner.message}`);
       }
@@ -167,17 +188,11 @@ export default function App() {
     });
   }, [savedPairing, openConnection]);
 
-  const sendFrame = useCallback((obj) => {
-    if (!wsRef.current || !sessionRef.current) return;
-    const frame = encrypt(sessionRef.current.tx, obj);
-    wsRef.current.send(JSON.stringify({ type: 'enc', ...frame }));
-  }, []);
-
   const sendPing = useCallback(() => sendFrame({ type: 'ping', at: Date.now() }), [sendFrame]);
 
   const startSession = useCallback(() => {
-    setOutput('');
-    sendFrame({ type: 'session:start', cols: 100, rows: 30 });
+    const dims = xtermRef.current?.getDims();
+    sendFrame({ type: 'session:start', cols: dims?.cols || 100, rows: dims?.rows || 30 });
   }, [sendFrame]);
 
   const stopSession = useCallback(() => sendFrame({ type: 'session:stop' }), [sendFrame]);
@@ -188,9 +203,8 @@ export default function App() {
     setInputValue('');
   }, [inputValue, sendFrame]);
 
-  // Raw control bytes for navigating interactive TUI menus (like Claude
-  // Code's own trust-folder / permission prompts) that can't be driven by
-  // typed text alone.
+  // Raw control bytes for navigating interactive TUI menus that can't be
+  // driven by typed text alone.
   const sendRaw = useCallback((data) => sendFrame({ type: 'session:input', data }), [sendFrame]);
   const CONTROL_KEYS = [
     { label: '↑', data: '\x1b[A' },
@@ -200,6 +214,7 @@ export default function App() {
     { label: 'Enter', data: '\r' },
     { label: 'Esc', data: '\x1b' },
     { label: 'Tab', data: '\t' },
+    { label: 'Shift+Tab', data: '\x1b[Z' },
     { label: 'Ctrl+C', data: '\x03' },
   ];
 
@@ -207,6 +222,25 @@ export default function App() {
     clearSavedPairing();
     setSavedPairing(null);
   }, []);
+
+  // Once the terminal mounts for a session, tell the daemon its real size
+  // (it started with a guessed default). Subsequent size changes are
+  // reported by XTermView's own resize handler.
+  useEffect(() => {
+    if (phase !== 'session') return;
+    const dims = xtermRef.current?.getDims();
+    if (dims) sendFrame({ type: 'session:resize', cols: dims.cols, rows: dims.rows });
+  }, [phase, sendFrame]);
+
+  const handleApprove = useCallback(() => {
+    if (pendingPrompt) sendRaw(pendingPrompt.approveKeys);
+    setPendingPrompt(null);
+  }, [pendingPrompt, sendRaw]);
+
+  const handleDeny = useCallback(() => {
+    if (pendingPrompt) sendRaw(pendingPrompt.denyKeys);
+    setPendingPrompt(null);
+  }, [pendingPrompt, sendRaw]);
 
   return (
     <div className="app">
@@ -247,10 +281,27 @@ export default function App() {
       {phase === 'session' && (
         <div className="session-panel">
           <p className="status-ok">Session live</p>
-          <pre className="terminal">
-            {output}
-            <span ref={outputEndRef} />
-          </pre>
+
+          {pendingPrompt && (
+            <div className="prompt-banner">
+              <p>Permission prompt detected: {pendingPrompt.matchedText}</p>
+              <div className="prompt-actions">
+                <button className="approve" onClick={handleApprove}>
+                  Approve
+                </button>
+                <button className="deny" onClick={handleDeny}>
+                  Deny
+                </button>
+              </div>
+            </div>
+          )}
+
+          <XTermView
+            ref={xtermRef}
+            onData={(data) => sendFrame({ type: 'session:input', data })}
+            onResize={(cols, rows) => sendFrame({ type: 'session:resize', cols, rows })}
+          />
+
           <div className="control-row">
             {CONTROL_KEYS.map((k) => (
               <button key={k.label} className="control-key" onClick={() => sendRaw(k.data)}>
