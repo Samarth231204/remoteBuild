@@ -47,6 +47,23 @@
   font-weight: 600;
 }
 
+.adapter-list,
+.session-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin-bottom: 1rem;
+}
+
+.session-footer-actions {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.session-footer-actions button {
+  flex: 1;
+}
+
 .idle-actions {
   display: flex;
   flex-direction: column;

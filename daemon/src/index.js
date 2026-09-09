@@ -12,13 +12,12 @@ import {
 import { checkCloudflaredInstalled, startTunnel } from './tunnel.js';
 import { printQrToTerminal, saveQrPng } from './pairing.js';
 import { AgentSession } from './agentSession.js';
+import { listAdaptersWithAvailability, getAdapter } from './adapters.js';
 
 const LOCAL_PORT = process.env.REMOTEBUILD_PORT
   ? Number(process.env.REMOTEBUILD_PORT)
   : 7532;
 
-const AGENT_CMD = process.env.AGENT_CMD || 'claude';
-const AGENT_ARGS = process.env.AGENT_ARGS ? process.env.AGENT_ARGS.split(' ') : [];
 const AGENT_CWD = process.env.AGENT_CWD || process.cwd();
 
 async function main() {
@@ -40,14 +39,21 @@ async function main() {
   let tokenConsumed = false;
 
   // Devices that completed the one-time QR pairing can reconnect for the
-  // rest of this daemon's lifetime without rescanning (e.g. after the phone
-  // locks or the network drops), using a longer-lived device token.
+  // rest of this daemon's lifetime without rescanning, using a longer-lived
+  // device token.
   const deviceTokens = new Set();
+  // Which session each device was last attached to, so a reconnect can
+  // resume the right one automatically.
+  const deviceLastAttached = new Map();
 
-  // Single active connection + single active agent session, matching
-  // Phase 1's one-device-at-a-time scope.
-  let paired = null; // { rx, tx, id, ws }
-  let agentSession = null;
+  // Multiple agent sessions (possibly different CLI agents) can run
+  // concurrently. Only one is "attached" to the paired connection at a
+  // time — its output streams live; the rest keep running and buffering
+  // in the background until attached to.
+  const sessions = new Map(); // sessionId -> { id, adapterId, agent }
+
+  // Single active connection, matching Phase 1's one-device-at-a-time scope.
+  let paired = null; // { rx, tx, id, ws, deviceToken, attachedSessionId }
 
   function sendEncrypted(ws, key, obj) {
     if (ws.readyState !== ws.OPEN) return;
@@ -55,22 +61,51 @@ async function main() {
     ws.send(JSON.stringify({ type: 'enc', ...frame }));
   }
 
-  function startAgentSession(cols, rows) {
-    agentSession = new AgentSession({
-      cmd: AGENT_CMD,
-      args: AGENT_ARGS,
+  function sessionSummaries() {
+    return [...sessions.values()].map((s) => ({
+      sessionId: s.id,
+      adapterId: s.adapterId,
+      exited: s.agent.exited,
+    }));
+  }
+
+  function sendAdaptersAndSessions(ws, tx) {
+    sendEncrypted(ws, tx, { type: 'adapters:list', adapters: listAdaptersWithAvailability() });
+    sendEncrypted(ws, tx, { type: 'session:list', sessions: sessionSummaries() });
+  }
+
+  function createSession(adapterId, cols, rows) {
+    const adapter = getAdapter(adapterId);
+    if (!adapter) return null;
+
+    const id = randomUUID();
+    const agent = new AgentSession({
+      cmd: adapter.cmd,
+      args: adapter.args,
       cwd: AGENT_CWD,
       cols: cols || 100,
       rows: rows || 30,
       onData: (data) => {
-        if (paired) sendEncrypted(paired.ws, paired.tx, { type: 'session:output', data });
+        if (paired && paired.attachedSessionId === id) {
+          sendEncrypted(paired.ws, paired.tx, { type: 'session:output', sessionId: id, data });
+        }
       },
       onExit: ({ exitCode, signal }) => {
-        if (paired) sendEncrypted(paired.ws, paired.tx, { type: 'session:exit', exitCode, signal });
-        agentSession = null;
+        if (paired) {
+          sendEncrypted(paired.ws, paired.tx, {
+            type: 'session:exit',
+            sessionId: id,
+            exitCode,
+            signal,
+          });
+        }
+        sessions.delete(id);
       },
     });
-    console.log(`Agent session started: ${AGENT_CMD} ${AGENT_ARGS.join(' ')}`.trim());
+
+    sessions.set(id, { id, adapterId, agent });
+    console.log(`Session ${id} started: ${adapter.label} (${adapter.cmd})`);
+    return sessions.get(id);
   }
 
   const wss = new WebSocketServer({ port: LOCAL_PORT, host: '127.0.0.1' });
@@ -126,7 +161,7 @@ async function main() {
         const deviceToken = usingDeviceToken ? msg.deviceToken : randomUUID();
         deviceTokens.add(deviceToken);
 
-        paired = { rx, tx, id: connId, ws };
+        paired = { rx, tx, id: connId, ws, deviceToken, attachedSessionId: null };
         handshakeComplete = true;
 
         ws.send(
@@ -138,14 +173,26 @@ async function main() {
         );
         console.log(`[${connId}] paired successfully — session encrypted`);
 
-        // If an agent session is already running (e.g. this device
-        // reconnected after a drop), resume it and replay recent output.
-        if (agentSession) {
-          sendEncrypted(ws, tx, { type: 'session:started', resumed: true });
-          if (agentSession.buffer) {
-            sendEncrypted(ws, tx, { type: 'session:output', data: agentSession.buffer });
+        const lastId = deviceLastAttached.get(deviceToken);
+        const lastEntry = lastId ? sessions.get(lastId) : null;
+        if (lastEntry) {
+          paired.attachedSessionId = lastEntry.id;
+          sendEncrypted(ws, tx, {
+            type: 'session:started',
+            sessionId: lastEntry.id,
+            adapterId: lastEntry.adapterId,
+            resumed: true,
+          });
+          if (lastEntry.agent.buffer) {
+            sendEncrypted(ws, tx, {
+              type: 'session:output',
+              sessionId: lastEntry.id,
+              data: lastEntry.agent.buffer,
+            });
           }
         }
+
+        sendAdaptersAndSessions(ws, tx);
         return;
       }
 
@@ -169,33 +216,76 @@ async function main() {
           break;
         }
 
+        case 'adapters:list': {
+          sendEncrypted(ws, paired.tx, { type: 'adapters:list', adapters: listAdaptersWithAvailability() });
+          break;
+        }
+
+        case 'session:list': {
+          sendEncrypted(ws, paired.tx, { type: 'session:list', sessions: sessionSummaries() });
+          break;
+        }
+
         case 'session:start': {
-          if (agentSession) {
-            sendEncrypted(ws, paired.tx, { type: 'session:started', resumed: true });
-            if (agentSession.buffer) {
-              sendEncrypted(ws, paired.tx, { type: 'session:output', data: agentSession.buffer });
-            }
+          const entry = createSession(inner.adapterId, inner.cols, inner.rows);
+          if (!entry) {
+            sendEncrypted(ws, paired.tx, {
+              type: 'session:error',
+              message: `Unknown or unavailable adapter: ${inner.adapterId}`,
+            });
             break;
           }
-          startAgentSession(inner.cols, inner.rows);
-          sendEncrypted(ws, paired.tx, { type: 'session:started', resumed: false });
+          paired.attachedSessionId = entry.id;
+          deviceLastAttached.set(paired.deviceToken, entry.id);
+          sendEncrypted(ws, paired.tx, {
+            type: 'session:started',
+            sessionId: entry.id,
+            adapterId: entry.adapterId,
+            resumed: false,
+          });
+          break;
+        }
+
+        case 'session:attach': {
+          const entry = sessions.get(inner.sessionId);
+          if (!entry) {
+            sendEncrypted(ws, paired.tx, { type: 'session:error', message: 'Session not found' });
+            break;
+          }
+          paired.attachedSessionId = entry.id;
+          deviceLastAttached.set(paired.deviceToken, entry.id);
+          sendEncrypted(ws, paired.tx, {
+            type: 'session:started',
+            sessionId: entry.id,
+            adapterId: entry.adapterId,
+            resumed: true,
+          });
+          if (entry.agent.buffer) {
+            sendEncrypted(ws, paired.tx, {
+              type: 'session:output',
+              sessionId: entry.id,
+              data: entry.agent.buffer,
+            });
+          }
           break;
         }
 
         case 'session:input': {
-          if (agentSession) agentSession.write(inner.data);
+          sessions.get(inner.sessionId)?.agent.write(inner.data);
           break;
         }
 
         case 'session:resize': {
-          if (agentSession) agentSession.resize(inner.cols, inner.rows);
+          sessions.get(inner.sessionId)?.agent.resize(inner.cols, inner.rows);
           break;
         }
 
         case 'session:stop': {
-          if (agentSession) {
-            agentSession.kill();
-            agentSession = null;
+          const entry = sessions.get(inner.sessionId);
+          if (entry) {
+            entry.agent.kill();
+            sessions.delete(inner.sessionId);
+            if (paired.attachedSessionId === inner.sessionId) paired.attachedSessionId = null;
           }
           break;
         }
@@ -210,9 +300,9 @@ async function main() {
       if (paired && paired.id === connId) {
         paired = null;
       }
-      // Note: the agent session (if any) is intentionally left running so a
-      // reconnecting device can resume it — it's only killed on explicit
-      // session:stop or daemon shutdown.
+      // Sessions are intentionally left running so a reconnecting device
+      // can resume them — only explicit session:stop or daemon shutdown
+      // kills them.
     });
 
     ws.on('error', (err) => {
@@ -244,12 +334,16 @@ async function main() {
     console.warn(`Could not save QR PNG: ${err.message}`);
   }
 
-  console.log(`\nAgent command: ${AGENT_CMD} ${AGENT_ARGS.join(' ')}`.trim());
-  console.log('Waiting for a device to pair... (this pairing token is single-use)');
+  const available = listAdaptersWithAvailability();
+  console.log('\nAvailable agent adapters:');
+  for (const a of available) {
+    console.log(`  ${a.available ? '✓' : '✗'} ${a.label} (${a.id})`);
+  }
+  console.log('\nWaiting for a device to pair... (this pairing token is single-use)');
 
   process.on('SIGINT', () => {
     console.log('\nShutting down...');
-    if (agentSession) agentSession.kill();
+    for (const entry of sessions.values()) entry.agent.kill();
     process.exit(0);
   });
 }

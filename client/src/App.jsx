@@ -48,11 +48,16 @@ export default function App() {
   const [inputValue, setInputValue] = useState('');
   const [savedPairing, setSavedPairing] = useState(() => loadSavedPairing());
   const [pendingPrompt, setPendingPrompt] = useState(null);
+  const [adapters, setAdapters] = useState([]);
+  const [sessionList, setSessionList] = useState([]);
+  const [activeSessionId, setActiveSessionId] = useState(null);
+  const [activeAdapterId, setActiveAdapterId] = useState(null);
 
   const wsRef = useRef(null);
   const sessionRef = useRef(null); // { rx, tx }
   const xtermRef = useRef(null);
   const promptTailRef = useRef('');
+  const activeSessionIdRef = useRef(null);
 
   const appendLog = useCallback((line) => {
     setLog((prev) => [...prev.slice(-19), `${new Date().toLocaleTimeString()}  ${line}`]);
@@ -71,13 +76,28 @@ export default function App() {
         return;
       }
 
+      if (inner.type === 'adapters:list') {
+        setAdapters(inner.adapters);
+        return;
+      }
+
+      if (inner.type === 'session:list') {
+        setSessionList(inner.sessions);
+        return;
+      }
+
       if (inner.type === 'session:started') {
-        appendLog(`session started (resumed=${inner.resumed})`);
-        if (!inner.resumed) {
-          xtermRef.current?.clear();
-          promptTailRef.current = '';
-          setPendingPrompt(null);
-        }
+        appendLog(`session started: ${inner.adapterId} (resumed=${inner.resumed})`);
+        // Always start from a clean terminal — the previously displayed
+        // content (if any) belongs to whichever session was shown before,
+        // and a resumed session's own scrollback arrives right after this
+        // as a session:output frame anyway.
+        xtermRef.current?.clear();
+        promptTailRef.current = '';
+        setPendingPrompt(null);
+        activeSessionIdRef.current = inner.sessionId;
+        setActiveSessionId(inner.sessionId);
+        setActiveAdapterId(inner.adapterId);
         setPhase('session');
         return;
       }
@@ -94,8 +114,13 @@ export default function App() {
 
       if (inner.type === 'session:exit') {
         appendLog(`session exited (code=${inner.exitCode}, signal=${inner.signal})`);
-        setPendingPrompt(null);
-        setPhase('paired');
+        if (activeSessionIdRef.current === inner.sessionId) {
+          activeSessionIdRef.current = null;
+          setActiveSessionId(null);
+          setActiveAdapterId(null);
+          setPendingPrompt(null);
+          setPhase('paired');
+        }
         return;
       }
 
@@ -190,22 +215,43 @@ export default function App() {
 
   const sendPing = useCallback(() => sendFrame({ type: 'ping', at: Date.now() }), [sendFrame]);
 
-  const startSession = useCallback(() => {
-    const dims = xtermRef.current?.getDims();
-    sendFrame({ type: 'session:start', cols: dims?.cols || 100, rows: dims?.rows || 30 });
+  const startSession = useCallback(
+    (adapterId) => {
+      const dims = xtermRef.current?.getDims();
+      sendFrame({ type: 'session:start', adapterId, cols: dims?.cols || 100, rows: dims?.rows || 30 });
+    },
+    [sendFrame],
+  );
+
+  const attachSession = useCallback(
+    (sessionId) => sendFrame({ type: 'session:attach', sessionId }),
+    [sendFrame],
+  );
+
+  const stopSession = useCallback(() => {
+    if (activeSessionIdRef.current) sendFrame({ type: 'session:stop', sessionId: activeSessionIdRef.current });
   }, [sendFrame]);
 
-  const stopSession = useCallback(() => sendFrame({ type: 'session:stop' }), [sendFrame]);
+  const switchToPicker = useCallback(() => {
+    setPhase('paired');
+    sendFrame({ type: 'session:list' });
+  }, [sendFrame]);
 
   const sendInput = useCallback(() => {
-    if (!inputValue) return;
-    sendFrame({ type: 'session:input', data: inputValue + '\n' });
+    if (!inputValue || !activeSessionIdRef.current) return;
+    sendFrame({ type: 'session:input', sessionId: activeSessionIdRef.current, data: inputValue + '\n' });
     setInputValue('');
   }, [inputValue, sendFrame]);
 
   // Raw control bytes for navigating interactive TUI menus that can't be
   // driven by typed text alone.
-  const sendRaw = useCallback((data) => sendFrame({ type: 'session:input', data }), [sendFrame]);
+  const sendRaw = useCallback(
+    (data) => {
+      if (!activeSessionIdRef.current) return;
+      sendFrame({ type: 'session:input', sessionId: activeSessionIdRef.current, data });
+    },
+    [sendFrame],
+  );
   const CONTROL_KEYS = [
     { label: '↑', data: '\x1b[A' },
     { label: '↓', data: '\x1b[B' },
@@ -227,10 +273,12 @@ export default function App() {
   // (it started with a guessed default). Subsequent size changes are
   // reported by XTermView's own resize handler.
   useEffect(() => {
-    if (phase !== 'session') return;
+    if (phase !== 'session' || !activeSessionId) return;
     const dims = xtermRef.current?.getDims();
-    if (dims) sendFrame({ type: 'session:resize', cols: dims.cols, rows: dims.rows });
-  }, [phase, sendFrame]);
+    if (dims) {
+      sendFrame({ type: 'session:resize', sessionId: activeSessionId, cols: dims.cols, rows: dims.rows });
+    }
+  }, [phase, activeSessionId, sendFrame]);
 
   const handleApprove = useCallback(() => {
     if (pendingPrompt) sendRaw(pendingPrompt.approveKeys);
@@ -272,15 +320,46 @@ export default function App() {
         <div className="connected-panel">
           <p className="status-ok">Connected &amp; encrypted</p>
           <button onClick={sendPing}>Send ping</button>
-          <button className="primary" onClick={startSession}>
-            Start agent session
-          </button>
+
+          <h2>Start a new session</h2>
+          <div className="adapter-list">
+            {adapters.map((a) => (
+              <button
+                key={a.id}
+                className="primary"
+                disabled={!a.available}
+                onClick={() => startSession(a.id)}
+                title={a.available ? '' : 'Not installed on this machine'}
+              >
+                {a.label}
+                {!a.available && ' (not installed)'}
+              </button>
+            ))}
+          </div>
+
+          {sessionList.length > 0 && (
+            <>
+              <h2>Running sessions</h2>
+              <div className="session-list">
+                {sessionList.map((s) => {
+                  const adapter = adapters.find((a) => a.id === s.adapterId);
+                  return (
+                    <button key={s.sessionId} onClick={() => attachSession(s.sessionId)}>
+                      {adapter?.label || s.adapterId} — {s.sessionId.slice(0, 8)}
+                    </button>
+                  );
+                })}
+              </div>
+            </>
+          )}
         </div>
       )}
 
       {phase === 'session' && (
         <div className="session-panel">
-          <p className="status-ok">Session live</p>
+          <p className="status-ok">
+            Session live — {adapters.find((a) => a.id === activeAdapterId)?.label || activeAdapterId}
+          </p>
 
           {pendingPrompt && (
             <div className="prompt-banner">
@@ -298,8 +377,16 @@ export default function App() {
 
           <XTermView
             ref={xtermRef}
-            onData={(data) => sendFrame({ type: 'session:input', data })}
-            onResize={(cols, rows) => sendFrame({ type: 'session:resize', cols, rows })}
+            onData={(data) => {
+              if (activeSessionIdRef.current) {
+                sendFrame({ type: 'session:input', sessionId: activeSessionIdRef.current, data });
+              }
+            }}
+            onResize={(cols, rows) => {
+              if (activeSessionIdRef.current) {
+                sendFrame({ type: 'session:resize', sessionId: activeSessionIdRef.current, cols, rows });
+              }
+            }}
           />
 
           <div className="control-row">
@@ -319,9 +406,12 @@ export default function App() {
             />
             <button onClick={sendInput}>Send</button>
           </div>
-          <button className="ghost" onClick={stopSession}>
-            Stop session
-          </button>
+          <div className="session-footer-actions">
+            <button onClick={switchToPicker}>Switch session</button>
+            <button className="ghost" onClick={stopSession}>
+              Stop session
+            </button>
+          </div>
         </div>
       )}
 
