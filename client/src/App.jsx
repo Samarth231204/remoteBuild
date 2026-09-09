@@ -53,6 +53,7 @@ export default function App() {
   const [activeSessionId, setActiveSessionId] = useState(null);
   const [activeAdapterId, setActiveAdapterId] = useState(null);
   const [ideInfo, setIdeInfo] = useState(null); // { available, url, password }
+  const [guiInfo, setGuiInfo] = useState(null); // { available, url, password }
 
   const wsRef = useRef(null);
   const sessionRef = useRef(null); // { rx, tx }
@@ -89,6 +90,11 @@ export default function App() {
 
       if (inner.type === 'ide:info') {
         setIdeInfo(inner);
+        return;
+      }
+
+      if (inner.type === 'gui:info') {
+        setGuiInfo(inner);
         return;
       }
 
@@ -363,6 +369,31 @@ export default function App() {
             </div>
           ) : (
             <p className="muted">code-server not installed on this machine.</p>
+          )}
+
+          <h2>Closed IDE tools (screen share)</h2>
+          {guiInfo?.available ? (
+            <div className="ide-panel">
+              <p>
+                A virtual display is running (noVNC) for GUI tools with no server mode, like
+                Cursor or Antigravity. Opens in a separate tab.
+              </p>
+              <button className="primary" onClick={() => window.open(guiInfo.url, '_blank')}>
+                Open screen
+              </button>
+              <div className="ide-password-row">
+                <span>Password: </span>
+                <code>{guiInfo.password}</code>
+                <button
+                  className="ghost"
+                  onClick={() => navigator.clipboard?.writeText(guiInfo.password).catch(() => {})}
+                >
+                  Copy
+                </button>
+              </div>
+            </div>
+          ) : (
+            <p className="muted">Docker is not installed/running on this machine.</p>
           )}
 
           {sessionList.length > 0 && (

@@ -14,6 +14,13 @@ import { printQrToTerminal, saveQrPng } from './pairing.js';
 import { AgentSession } from './agentSession.js';
 import { listAdaptersWithAvailability, getAdapter } from './adapters.js';
 import { isCodeServerInstalled, generatePassword, startCodeServer } from './codeServer.js';
+import {
+  isDockerAvailable,
+  generateVncPassword,
+  buildImageIfNeeded,
+  startContainer,
+  stopContainer,
+} from './dockerGui.js';
 
 const LOCAL_PORT = process.env.REMOTEBUILD_PORT
   ? Number(process.env.REMOTEBUILD_PORT)
@@ -22,6 +29,13 @@ const LOCAL_PORT = process.env.REMOTEBUILD_PORT
 const CODE_SERVER_PORT = process.env.REMOTEBUILD_CODE_SERVER_PORT
   ? Number(process.env.REMOTEBUILD_CODE_SERVER_PORT)
   : 8080;
+
+const GUI_PORT = process.env.REMOTEBUILD_GUI_PORT
+  ? Number(process.env.REMOTEBUILD_GUI_PORT)
+  : 6080;
+
+const GUI_APP_CMD = process.env.GUI_APP_CMD || null; // null = image default (xterm stand-in)
+const GUI_CONTAINER_NAME = 'remotebuild-gui-session';
 
 const AGENT_CWD = process.env.AGENT_CWD || process.cwd();
 const IDE_WORKSPACE_DIR = process.env.IDE_WORKSPACE_DIR || AGENT_CWD;
@@ -67,6 +81,11 @@ async function main() {
   let ideInfo = null; // { url, password }
   let codeServerProcess = null;
 
+  // Docker + Xvfb + noVNC container for closed GUI tools with no server
+  // mode (Cursor, Antigravity). Same non-fatal-if-unavailable pattern as
+  // code-server.
+  let guiInfo = null; // { url, password }
+
   function sendEncrypted(ws, key, obj) {
     if (ws.readyState !== ws.OPEN) return;
     const frame = encrypt(key, obj);
@@ -89,6 +108,12 @@ async function main() {
       available: Boolean(ideInfo),
       url: ideInfo?.url,
       password: ideInfo?.password,
+    });
+    sendEncrypted(ws, tx, {
+      type: 'gui:info',
+      available: Boolean(guiInfo),
+      url: guiInfo?.url,
+      password: guiInfo?.password,
     });
   }
 
@@ -254,6 +279,16 @@ async function main() {
           break;
         }
 
+        case 'gui:info': {
+          sendEncrypted(ws, paired.tx, {
+            type: 'gui:info',
+            available: Boolean(guiInfo),
+            url: guiInfo?.url,
+            password: guiInfo?.password,
+          });
+          break;
+        }
+
         case 'session:start': {
           const entry = createSession(inner.adapterId, inner.cols, inner.rows);
           if (!entry) {
@@ -390,12 +425,37 @@ async function main() {
     console.log('Install it with:  brew install code-server');
   }
 
+  if (isDockerAvailable()) {
+    try {
+      await buildImageIfNeeded();
+      console.log('\nStarting GUI container (Xvfb + noVNC, for closed IDE tools)...');
+      const password = generateVncPassword();
+      await startContainer({
+        port: GUI_PORT,
+        password,
+        appCmd: GUI_APP_CMD,
+        containerName: GUI_CONTAINER_NAME,
+      });
+      const { url: guiHttpsUrl } = await startTunnel(GUI_PORT);
+      guiInfo = { url: `${guiHttpsUrl}/vnc.html?autoconnect=true`, password };
+      console.log(`GUI container ready: ${guiInfo.url}`);
+      console.log(`GUI container VNC password: ${password}`);
+    } catch (err) {
+      console.warn(`GUI container did not start (closed-IDE tab will be unavailable): ${err.message}`);
+      guiInfo = null;
+    }
+  } else {
+    console.log('\nDocker is not installed/running — closed-IDE tab will be unavailable.');
+    console.log('Install Docker Desktop to enable it.');
+  }
+
   console.log('\nWaiting for a device to pair... (this pairing token is single-use)');
 
   process.on('SIGINT', () => {
     console.log('\nShutting down...');
     for (const entry of sessions.values()) entry.agent.kill();
     if (codeServerProcess) codeServerProcess.kill();
+    stopContainer(GUI_CONTAINER_NAME);
     process.exit(0);
   });
 }
