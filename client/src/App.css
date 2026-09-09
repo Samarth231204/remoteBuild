@@ -64,6 +64,33 @@
   flex: 1;
 }
 
+.ide-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin-bottom: 1rem;
+  text-align: left;
+}
+
+.ide-password-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.85rem;
+}
+
+.ide-password-row code {
+  background: #1f2937;
+  color: #e5e7eb;
+  padding: 0.2rem 0.5rem;
+  border-radius: 0.3rem;
+}
+
+.muted {
+  color: #9ca3af;
+  font-size: 0.9rem;
+}
+
 .idle-actions {
   display: flex;
   flex-direction: column;

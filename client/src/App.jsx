@@ -52,6 +52,7 @@ export default function App() {
   const [sessionList, setSessionList] = useState([]);
   const [activeSessionId, setActiveSessionId] = useState(null);
   const [activeAdapterId, setActiveAdapterId] = useState(null);
+  const [ideInfo, setIdeInfo] = useState(null); // { available, url, password }
 
   const wsRef = useRef(null);
   const sessionRef = useRef(null); // { rx, tx }
@@ -83,6 +84,11 @@ export default function App() {
 
       if (inner.type === 'session:list') {
         setSessionList(inner.sessions);
+        return;
+      }
+
+      if (inner.type === 'ide:info') {
+        setIdeInfo(inner);
         return;
       }
 
@@ -336,6 +342,28 @@ export default function App() {
               </button>
             ))}
           </div>
+
+          <h2>IDE</h2>
+          {ideInfo?.available ? (
+            <div className="ide-panel">
+              <p>VS Code (code-server) is running. It opens in a separate tab with its own login.</p>
+              <button className="primary" onClick={() => window.open(ideInfo.url, '_blank')}>
+                Open VS Code
+              </button>
+              <div className="ide-password-row">
+                <span>Password: </span>
+                <code>{ideInfo.password}</code>
+                <button
+                  className="ghost"
+                  onClick={() => navigator.clipboard?.writeText(ideInfo.password).catch(() => {})}
+                >
+                  Copy
+                </button>
+              </div>
+            </div>
+          ) : (
+            <p className="muted">code-server not installed on this machine.</p>
+          )}
 
           {sessionList.length > 0 && (
             <>

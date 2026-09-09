@@ -13,12 +13,18 @@ import { checkCloudflaredInstalled, startTunnel } from './tunnel.js';
 import { printQrToTerminal, saveQrPng } from './pairing.js';
 import { AgentSession } from './agentSession.js';
 import { listAdaptersWithAvailability, getAdapter } from './adapters.js';
+import { isCodeServerInstalled, generatePassword, startCodeServer } from './codeServer.js';
 
 const LOCAL_PORT = process.env.REMOTEBUILD_PORT
   ? Number(process.env.REMOTEBUILD_PORT)
   : 7532;
 
+const CODE_SERVER_PORT = process.env.REMOTEBUILD_CODE_SERVER_PORT
+  ? Number(process.env.REMOTEBUILD_CODE_SERVER_PORT)
+  : 8080;
+
 const AGENT_CWD = process.env.AGENT_CWD || process.cwd();
+const IDE_WORKSPACE_DIR = process.env.IDE_WORKSPACE_DIR || AGENT_CWD;
 
 async function main() {
   console.log('remoteBuild daemon starting...\n');
@@ -55,6 +61,12 @@ async function main() {
   // Single active connection, matching Phase 1's one-device-at-a-time scope.
   let paired = null; // { rx, tx, id, ws, deviceToken, attachedSessionId }
 
+  // code-server (VS Code in the browser), started once below if installed.
+  // null means unavailable — the client shows it as disabled rather than
+  // failing when the phone tries to open it.
+  let ideInfo = null; // { url, password }
+  let codeServerProcess = null;
+
   function sendEncrypted(ws, key, obj) {
     if (ws.readyState !== ws.OPEN) return;
     const frame = encrypt(key, obj);
@@ -69,9 +81,15 @@ async function main() {
     }));
   }
 
-  function sendAdaptersAndSessions(ws, tx) {
+  function sendPickerData(ws, tx) {
     sendEncrypted(ws, tx, { type: 'adapters:list', adapters: listAdaptersWithAvailability() });
     sendEncrypted(ws, tx, { type: 'session:list', sessions: sessionSummaries() });
+    sendEncrypted(ws, tx, {
+      type: 'ide:info',
+      available: Boolean(ideInfo),
+      url: ideInfo?.url,
+      password: ideInfo?.password,
+    });
   }
 
   function createSession(adapterId, cols, rows) {
@@ -192,7 +210,7 @@ async function main() {
           }
         }
 
-        sendAdaptersAndSessions(ws, tx);
+        sendPickerData(ws, tx);
         return;
       }
 
@@ -223,6 +241,16 @@ async function main() {
 
         case 'session:list': {
           sendEncrypted(ws, paired.tx, { type: 'session:list', sessions: sessionSummaries() });
+          break;
+        }
+
+        case 'ide:info': {
+          sendEncrypted(ws, paired.tx, {
+            type: 'ide:info',
+            available: Boolean(ideInfo),
+            url: ideInfo?.url,
+            password: ideInfo?.password,
+          });
           break;
         }
 
@@ -339,11 +367,35 @@ async function main() {
   for (const a of available) {
     console.log(`  ${a.available ? '✓' : '✗'} ${a.label} (${a.id})`);
   }
+
+  if (isCodeServerInstalled()) {
+    try {
+      console.log('\nStarting code-server (VS Code in the browser)...');
+      const password = generatePassword();
+      codeServerProcess = await startCodeServer({
+        port: CODE_SERVER_PORT,
+        workspaceDir: IDE_WORKSPACE_DIR,
+        password,
+      });
+      const { url: codeServerHttpsUrl } = await startTunnel(CODE_SERVER_PORT);
+      ideInfo = { url: codeServerHttpsUrl, password };
+      console.log(`code-server ready: ${codeServerHttpsUrl}`);
+      console.log(`code-server password: ${password}`);
+    } catch (err) {
+      console.warn(`code-server did not start (IDE tab will be unavailable): ${err.message}`);
+      ideInfo = null;
+    }
+  } else {
+    console.log('\ncode-server is not installed — IDE tab will be unavailable.');
+    console.log('Install it with:  brew install code-server');
+  }
+
   console.log('\nWaiting for a device to pair... (this pairing token is single-use)');
 
   process.on('SIGINT', () => {
     console.log('\nShutting down...');
     for (const entry of sessions.values()) entry.agent.kill();
+    if (codeServerProcess) codeServerProcess.kill();
     process.exit(0);
   });
 }
